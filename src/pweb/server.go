@@ -28,7 +28,7 @@ func (o Options) Quiet() bool {
 }
 
 func (o Options) Verbose() bool {
-  return (o & OptionVerbose) == OptionVerbose
+  return (o & OptionVerbose) == OptionVerbose && !o.Quiet()
 }
 
 func (o Options) Debug() bool {
@@ -45,8 +45,7 @@ func (o Options) Strict() bool {
 type Config struct {
   Addr    string
   Root    string
-  Proxy   string
-  Routes  map[string][]string
+  Proxies map[string]string
   Options Options
 }
 
@@ -56,9 +55,8 @@ type Config struct {
 type Server struct {
   addr    string
   root    string
-  routes  map[string][]string
-  peer    *url.URL
   proxy   *proxy.ReverseProxy
+  targets map[string]*url.URL
   options Options
 }
 
@@ -69,17 +67,21 @@ func New(conf Config) (*Server, error) {
   s := &Server{
     addr:     conf.Addr,
     root:     conf.Root,
-    routes:   conf.Routes,
     options:  conf.Options,
   }
-  if conf.Proxy != "" {
-    target, err := url.Parse(conf.Proxy)
-    if err != nil {
-      return nil, err
+  
+  if conf.Proxies != nil && len(conf.Proxies) > 0 {
+    s.proxy = &proxy.ReverseProxy{Director:s.proxyDirector}
+    s.targets = make(map[string]*url.URL)
+    for k, v := range conf.Proxies {
+      u, err := url.Parse(v)
+      if err != nil {
+        return nil, err
+      }
+      s.targets[k] = u
     }
-    s.proxy = proxy.NewSingleHostReverseProxy(target)
-    s.peer = target
   }
+  
   return s, nil
 }
 
@@ -97,6 +99,10 @@ func (s *Server) Run() error {
     ReadTimeout: 30 * time.Second,
   }
   
+  if !s.options.Quiet() {
+    log.Printf("Accepting connections on %v", s.addr)
+  }
+  
   return server.ListenAndServe()
 }
 
@@ -104,100 +110,73 @@ func (s *Server) Run() error {
  * Proxy a request
  */
 func (s *Server) handleRequest(rsp http.ResponseWriter, req *http.Request) {
-  if s.proxy != nil && (s.options & OptionVerbose) == OptionVerbose {
-    if u, err := url.Parse(req.URL.Path); err == nil {
-      log.Printf("%s %s \u2192 %v", req.Method, req.URL.Path, s.peer.ResolveReference(u))
+  if s.proxy != nil && s.proxyTarget(req.URL.Path) != nil {
+    err := s.proxy.ServeHTTP(rsp, req)
+    if err == proxy.FileNotFoundError {
+      s.serveRequest(rsp, req)
+    }else if err != nil {
+      s.serveError(rsp, req, http.StatusBadGateway, fmt.Errorf("Could not proxy request: %v", err))
     }
+  }else{
+    s.serveRequest(rsp, req)
   }
-  if s.proxy == nil {
-    s.serveError(rsp, req, http.StatusBadGateway, fmt.Errorf("No proxy is configured for non-managed resource: %s", req.URL.Path))
-  }else if err := s.proxy.ServeHTTP(rsp, req); err == proxy.FileNotFoundError {
-    s.serveRequestWithOptions(rsp, req, false) // attempt to serve the local version
-  }else if err != nil {
-    s.serveError(rsp, req, http.StatusBadGateway, err)
-  }
-}
-
-/**
- * Route a request
- */
-func (s *Server) routeRequest(request *http.Request) ([]string, string, error) {
-  alternates := make([]string, 0)
-  absolute := request.URL.Path
-  
-  for k, v := range s.routes {
-    if strings.HasPrefix(absolute, k) {
-      for _, e := range v {
-        alternates = append(alternates, path.Join(e, absolute[len(k):]))
-      }
-    }
-  }
-  
-  ext := path.Ext(absolute)
-  relatives := make([]string, len(alternates))
-  bases := make([]string, len(alternates))
-  
-  for i, e := range alternates {
-    r := path.Join(s.root, e[1:])
-    relatives[i] = r
-    bases[i] = r[:len(r) - len(ext)]
-  }
-  
-  var mimetype string
-  if mimetype = mime.TypeByExtension(ext); mimetype == "" {
-    mimetype = "text/plain"
-  }
-  
-  return relatives, mimetype, nil
 }
 
 /**
  * Serve a request
  */
 func (s *Server) serveRequest(rsp http.ResponseWriter, req *http.Request) {
-  s.serveRequestWithOptions(rsp, req, true)
-}
-
-/**
- * Serve a request
- */
-func (s *Server) serveRequestWithOptions(rsp http.ResponseWriter, req *http.Request, allowProxy bool) {
   
   candidates, mimetype, err := s.routeRequest(req)
   if err != nil {
-    s.serveError(rsp, req, http.StatusNotFound, fmt.Errorf("Could not map resource: %s", req.URL.Path))
+    s.serveError(rsp, req, http.StatusNotFound, fmt.Errorf("Could not route resource: %s", req.URL.Path))
     return
   }
   
-  if (s.options & OptionVerbose) == OptionVerbose {
+  if s.options.Verbose() {
     log.Printf("%s %s \u2192 {%s}", req.Method, req.URL.Path, strings.Join(candidates, ", "))
   }
   
   for _, e := range candidates {
     file, err := os.Open(e)
-    if err == nil {
-      defer file.Close()
-      if (s.options & OptionVerbose) == OptionVerbose || (s.options & OptionQuiet) != OptionQuiet {
-        log.Printf("%s %s \u2192 %s", req.Method, req.URL.Path, e)
-      }
-      rsp.Header().Add("Content-Type", mimetype)
-      s.serveFile(rsp, req, file)
+    if os.IsNotExist(err) {
+      continue
+    }else if err != nil {
+      s.serveError(rsp, req, http.StatusInternalServerError, fmt.Errorf("Could not read resource: %s", req.URL.Path))
       return
     }
+    defer file.Close()
+    rsp.Header().Add("Content-Type", mimetype)
+    s.serveFile(rsp, req, file)
+    return
   }
   
-  if !allowProxy || (s.options & OptionStrict) == OptionStrict || s.proxy == nil {
-    s.serveError(rsp, req, http.StatusNotFound, fmt.Errorf("No such resource: %s", req.URL.Path))
-  }else{
-    s.handleRequest(rsp, req)
+  s.serveError(rsp, req, http.StatusNotFound, fmt.Errorf("No such resource: %s", req.URL.Path))
+}
+
+/**
+ * Route a request
+ */
+func (s *Server) routeRequest(request *http.Request) ([]string, string, error) {
+  abs := request.URL.Path
+  ext := path.Ext(abs)
+  
+  var mimetype string
+  if mimetype = mime.TypeByExtension(ext); mimetype == "" {
+    mimetype = "text/plain"
   }
   
+  candidates := []string{path.Join(s.root, abs[1:])}
+  return candidates, mimetype, nil
 }
 
 /**
  * Serve a request
  */
 func (s *Server) serveFile(rsp http.ResponseWriter, req *http.Request, file *os.File) {
+  if s.options.Verbose() {
+    log.Printf("%s %s \u2192 %s", req.Method, req.URL.Path, file.Name())
+  }
   
   fstat, err := file.Stat()
   if err != nil {

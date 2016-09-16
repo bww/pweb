@@ -56,7 +56,7 @@ func main() {
     Addr: *fAddr,
     Root: *fDocroot,
     Options: options,
-    // Proxy: *fProxy,
+    Proxies: proxies,
   }
   
   server, err := pweb.New(conf)
