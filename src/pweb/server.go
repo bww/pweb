@@ -23,6 +23,22 @@ const (
   OptionStrict  = Options(1 << 3)
 )
 
+func (o Options) Quiet() bool {
+  return (o & OptionQuiet) == OptionQuiet
+}
+
+func (o Options) Verbose() bool {
+  return (o & OptionVerbose) == OptionVerbose
+}
+
+func (o Options) Debug() bool {
+  return (o & OptionDebug) == OptionDebug
+}
+
+func (o Options) Strict() bool {
+  return (o & OptionStrict) == OptionStrict
+}
+
 /**
  * Configuration
  */

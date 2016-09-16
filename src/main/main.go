@@ -52,8 +52,6 @@ func main() {
     }
   }
   
-  fmt.Println(proxies)
-  
   conf := pweb.Config{
     Addr: *fAddr,
     Root: *fDocroot,
