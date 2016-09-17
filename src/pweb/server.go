@@ -184,11 +184,62 @@ func (s *Server) serveFile(rsp http.ResponseWriter, req *http.Request, file *os.
     return
   }
   if fstat.Mode().IsDir() {
-    s.serveError(rsp, req, http.StatusBadRequest, fmt.Errorf("Resource is not a file: %v", file.Name()))
+    s.serveIndex(rsp, req, file)
     return
   }
   
   _, err = io.Copy(rsp, file)
+  if err != nil { // no reason to believe writing an error would work...
+    log.Println("Could not write response:", err)
+    return
+  }
+  
+}
+
+/**
+ * Serve a request
+ */
+func (s *Server) serveIndex(rsp http.ResponseWriter, req *http.Request, file *os.File) {
+  if s.options.Strict() {
+    s.serveError(rsp, req, http.StatusForbidden, fmt.Errorf("Indexes are not permitted: %v", file.Name()))
+    return
+  }
+  
+  infos, err := file.Readdir(0)
+  if err != nil {
+    s.serveError(rsp, req, http.StatusBadRequest, fmt.Errorf("Could not read directory: %v", file.Name()))
+    return
+  }
+  
+  index := `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>PWeb</title>
+</head>
+<body>
+  <ul>
+%v
+  </ul>
+</body>
+</html>`
+  
+  var entries string
+  for _, e := range infos {
+    n := e.Name()
+    if e.IsDir() {
+      n += "/"
+    }
+    ref, err := url.Parse(n)
+    if err != nil {
+      s.serveError(rsp, req, http.StatusBadRequest, fmt.Errorf("Could not list directory: %v", file.Name()))
+      return
+    }
+    entries += fmt.Sprintf(`<li><a href="%v">%v</a></li>`, ref, e.Name())
+  }
+  
+  rsp.Header().Add("Content-Type", "text/html")
+  _, err = rsp.Write([]byte(fmt.Sprintf(index, entries)))
   if err != nil { // no reason to believe writing an error would work...
     log.Println("Could not write response:", err)
     return

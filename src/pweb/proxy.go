@@ -22,7 +22,7 @@ func (s *Server) proxyTarget(p string) *url.URL {
   return target
 }
 
-/** 
+/**
  * Proxy a request
  */
 func (s *Server) proxyDirector(req *http.Request) {
